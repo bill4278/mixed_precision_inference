@@ -1,4 +1,4 @@
-# A Practice of Mixed Precision Inference by TensorRT #
+# A Sample of Mixed Precision Inference by TensorRT #
 
 ## build ##
 
