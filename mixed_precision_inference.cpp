@@ -45,14 +45,13 @@ static DataType gDATA_TYPE = DataType::kINT8;
 static const char* kINPUT_NAME = "my_intput";
 static const char* kOUTPUT_NAME = "my_output";
 static const char* kWEIGHT_NAME = "my_weight";
-static int gMAX_BATCH_SIZE = 8;
+static int gMAX_BATCH_SIZE = 2;
 static size_t gWORKSAPCE_SIZE = 0;
 static int gCUDA_DEVICE = 0;
 static std::vector<float*> gWEIGHT;
-static const int kINPUT_CHANNEL = 256;
-static const int kINPUT_SIZE = 128;
-static const int kOUTPUT_CHANNEL = 256;
-static const int kFILTER_SIZE = 3;
+static const int kINPUT_CHANNEL = 3;
+static const int kINPUT_SIZE = 8;
+static const int kOUTPUT_CHANNEL = 3;
 
 void DelWeight(void) {
   for (auto* ptr : gWEIGHT) {
@@ -82,119 +81,160 @@ ITensor* Input(const char* input_name, int c, int hw) {
   return input_out;
 }
 
-ITensor* Input8(const char* input_name, int c, int hw) {
-  auto* input_out = gNET->addInput(input_name, DataType::kINT8, DimsCHW(c, hw, hw));
+ITensor* Conv(ITensor* input_tensor, int fco, int fci, int fhw, 
+  float init_file_value, float init_bias_value, DataType dtype) {
 
-  if (gDATA_TYPE == DataType::kINT8) {
-    SetTensorRange(input_out);
+  int w_count = fco * fci * fhw * fhw;
+  float* w_data = new float[w_count]();
+  for (int i = 0; i < w_count; ++i) {
+    w_data[i] = init_file_value;
   }
-  return input_out;
-}
-
-ITensor* Conv(ITensor* input_tensor, int fco, int fci, int fhw, int stride, DataType dtype) {
-  int conv_w_num = fco * fci * fhw * fhw;
-  float* conv_w_data = new float[conv_w_num]();
-  gWEIGHT.push_back(conv_w_data);
-  Weights weight{DataType::kFLOAT, static_cast<void*>(conv_w_data), static_cast<int64_t>(conv_w_num)};
+  gWEIGHT.push_back(w_data);
+  Weights weight{DataType::kFLOAT, static_cast<void*>(w_data), static_cast<int64_t>(w_count)};
 
   float* bias_data = new float[fco]();
+  for (int i = 0; i < fco; ++i) {
+    bias_data[i] = init_bias_value;
+  }
   gWEIGHT.push_back(bias_data);
   Weights bias{DataType::kFLOAT, static_cast<void*>(bias_data), static_cast<int64_t>(fco)};
 
   DimsHW nv_ksize(fhw, fhw);
 
-  auto *iconv_layer = gNET->addConvolution(*input_tensor, fco, nv_ksize, weight, bias);
+  auto *conv_layer = gNET->addConvolution(*input_tensor, fco, nv_ksize, weight, bias);
   DimsHW nv_dilations(1, 1);
-  DimsHW nv_strides(stride, stride);
+  DimsHW nv_strides(1, 1);
   DimsHW nv_paddings(fhw/2, fhw/2);
-  iconv_layer->setDilation(nv_dilations);
-  iconv_layer->setStride(nv_strides);
-  iconv_layer->setPadding(nv_paddings);
-  iconv_layer->setNbGroups(1);
+  conv_layer->setDilation(nv_dilations);
+  conv_layer->setStride(nv_strides);
+  conv_layer->setPadding(nv_paddings);
+  conv_layer->setNbGroups(1);
 
   static int count = 0;
   std::string name = "my_conv" + std::to_string(count);
-  iconv_layer->setName(name.c_str());
+  conv_layer->setName(name.c_str());
 
-  auto tensor_out = iconv_layer->getOutput(0);
+  auto tensor_out = conv_layer->getOutput(0);
   name += std::string("_output");
   tensor_out->setName(name.c_str());
   count++;
   
-  SetLayerPrecision(iconv_layer, dtype);
+  SetLayerPrecision(conv_layer, dtype);
 
   return tensor_out;
 }
 
-ITensor* ElemAdd(ITensor* input_tensor1, ITensor* input_tensor2, DataType dtype) {
-  auto* elem_add_layer = gNET->addElementWise(*input_tensor1, *input_tensor2, ElementWiseOperation::kSUM);
+ITensor* Concat(ITensor* input_tensor1, ITensor* input_tensor2, DataType dtype)
+{
+  ITensor* inputs[2] = {input_tensor1, input_tensor2};
+  auto* concat_layer = gNET->addConcatenation(inputs, 2);
+  
+  SetLayerPrecision(concat_layer, dtype);
 
-  // SetLayerPrecision(elem_add_layer);
-  // force layer to be FP32
-  elem_add_layer->setPrecision(DataType::kFLOAT);
-  elem_add_layer->setOutputType(0, DataType::kFLOAT);
-  return elem_add_layer->getOutput(0);
+  return concat_layer->getOutput(0);
+}
+
+int GetDimsCount(Dims dims) {
+  int count = 1;
+  for (int i = 0; i < dims.nbDims; ++i) {
+    count *= dims.d[i];
+  }
+  return count;  
+}
+
+void VerifyDims(Dims dims) {
+  printf("Dims: ");
+  for (int i = 0; i < dims.nbDims; ++i) {
+    printf("%d, ", dims.d[i]);
+  }
+  printf("\n");
 }
 
 std::vector<void*> PrepareInputOutputBuffers(const ICudaEngine* engine, 
-  int max_batch_size,
-  const char* output_name, int co,
-  const char* input_name, int ci, int hw,
-  const char* weight_name) {
+  int max_batch_size, const char* output_name, const char* input_name) {
 
-  std::vector<void*> buffers(3);
+  auto nbBindings = engine->getNbBindings();
+  std::vector<void*> buffers(nbBindings);
 
-  int input_num = max_batch_size * ci * hw * hw;
-  
-  float *input_dev; 
-  cudaMalloc((void**)&input_dev, input_num * sizeof(float));
+  auto input_index = engine->getBindingIndex(input_name);
+  auto input_dims = engine->getBindingDimensions(input_index);
+  VerifyDims(input_dims);
+  auto input_count = GetDimsCount(input_dims);
 
-  const int input_index = engine->getBindingIndex(input_name);
-  buffers[input_index] = static_cast<void*>(input_dev);
+  float *d_input; 
+  cudaMalloc((void**)&d_input, max_batch_size * input_count * sizeof(float));
+  buffers[input_index] = static_cast<void*>(d_input);
+  auto *h_input = new float[max_batch_size * input_count];
+  auto *base = h_input;
+  for (int b = 0; b < max_batch_size; ++b) {
+    for (int c = 0; c < input_count; ++c) {
+      *h_input = static_cast<float>(b + 1);
+      h_input++;
+    }
+  }
+  cudaMemcpy(d_input, base, max_batch_size * input_count * sizeof(float), cudaMemcpyHostToDevice);
+  delete [] base;
 
-  int output_num = max_batch_size * co * hw * hw;
-  float *output_dev;
-  cudaMalloc((void**)&output_dev, output_num * sizeof(float));
+
   const int output_index = engine->getBindingIndex(output_name);
-  buffers[output_index] = static_cast<void*>(output_dev);
+  auto output_dims = engine->getBindingDimensions(output_index);
+  VerifyDims(output_dims);
+  auto output_count = GetDimsCount(output_dims);
 
-  int weight_num = max_batch_size * co * hw * hw;
-  float *weight_dev;
-  cudaMalloc((void**)&weight_dev, weight_num * sizeof(float));
-  const int weight_index = engine->getBindingIndex(weight_name);
-  buffers[weight_index] = static_cast<void*>(weight_dev);
+  float *d_output;
+  cudaMalloc((void**)&d_output, max_batch_size * output_count * sizeof(float));
+  buffers[output_index] = static_cast<void*>(d_output);
 
   return buffers;
 }
 
-void Inference(IExecutionContext* context, std::vector<void*> buffers, cudaStream_t stream, int max_batch_size) {
-  struct timeval start;
-  struct timeval end; 
+void VerifyOutputTensor(void* d_ptr, int max_batch_size, Dims output_dims) {
+  assert(output_dims.nbDims == 3);
+  assert(output_dims.d[1] == output_dims.d[2]);
+  int co = output_dims.d[0];
+  int hw = output_dims.d[1];
+  int count = max_batch_size * co * hw * hw; 
+  auto* h_ptr = new float[count]();
+  auto* base_ptr = h_ptr;
+  cudaMemcpy(h_ptr, d_ptr, count * sizeof(float), cudaMemcpyDeviceToHost);
 
-  for (int j = 0; j < 10; ++j) {
-    gettimeofday(&start, nullptr);
-    for (int i = 0; i < 10; ++i) {
-      context->enqueue(1, buffers.data(), stream, nullptr);
+  for (int b = 0; b < max_batch_size; ++b) {
+    printf("batch %d:\n", b);
+    for (int c = 0; c < co; ++c) {
+      printf("channel %d:\n", c);
+      for (int y = 0; y < hw; ++y) {
+        for (int x = 0; x < hw; ++x) {
+          printf("%.2f, ", *h_ptr);
+          h_ptr++;
+        }
+        printf("\n");
+      }
+      printf("\n\n");
     }
-    cudaStreamSynchronize(stream);
-    gettimeofday(&end, nullptr);
-    unsigned long diff = 1000000 * (end.tv_sec - start.tv_sec) + end.tv_usec - start.tv_usec;
-    float avg_delta = static_cast<float>(diff) / 10.f;
-    std::cout << "time (ms): " << (avg_delta / 1000.f) <<
-      ", FPS: " << (static_cast<float>(max_batch_size) / (avg_delta / 1000000.f)) << std::endl;
+    printf("\n\n\n");
   }
+
+  delete [] base_ptr;
+}
+
+void Inference(IExecutionContext* context, std::vector<void*> buffers,
+  int max_batch_size, int output_index) {
+
+  context->execute(max_batch_size, buffers.data());
+  auto output_dims = context->getBindingDimensions(1);
+  VerifyOutputTensor(buffers[output_index], max_batch_size, output_dims);    
 }
 
 void UseTrtLayerAPI(int max_batch_size, size_t workspace_size, DataType exec_type) {
   auto builder = createInferBuilder(gLogger);
   gNET = builder->createNetwork();
 
-  auto* input    = Input(kINPUT_NAME, kINPUT_CHANNEL, kINPUT_SIZE);
-  auto* conv0 = Conv(input, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* conv1 = Conv(conv0, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* conv2 = Conv(conv1, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* w_out    = Input(kWEIGHT_NAME, kOUTPUT_CHANNEL, kINPUT_SIZE);
-  auto* output   = ElemAdd(conv2, w_out, DataType::kFLOAT);
+  auto* input  = Input(kINPUT_NAME, kINPUT_CHANNEL, kINPUT_SIZE);
+  
+  auto* conv0  = Conv(input, kOUTPUT_CHANNEL, kINPUT_CHANNEL, 1, 1.0, 0.0, exec_type);
+  auto* conv2  = Conv(input, kOUTPUT_CHANNEL, kINPUT_CHANNEL, 1, 2.0, 0.0, exec_type);
+  auto* output = Concat(conv0, conv2, exec_type);
+
   output->setName(kOUTPUT_NAME);
   gNET->markOutput(*output);
 
@@ -210,31 +250,25 @@ void UseTrtLayerAPI(int max_batch_size, size_t workspace_size, DataType exec_typ
   }
 
   builder->setStrictTypeConstraints(true);
-  auto engine = builder->buildCudaEngine(*gNET); 
+  auto engine = builder->buildCudaEngine(*gNET);
   gNET->destroy(); 
   DelWeight();
 
   auto buffers = PrepareInputOutputBuffers(engine, max_batch_size,
-    kOUTPUT_NAME, kOUTPUT_CHANNEL,
-    kINPUT_NAME, kINPUT_CHANNEL, kINPUT_SIZE,
-    kWEIGHT_NAME);
+    kOUTPUT_NAME, kINPUT_NAME);
 
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
   std::cout << "Executing..." << std::endl;
   auto context = engine->createExecutionContext();
+  auto output_index = engine->getBindingIndex(kOUTPUT_NAME);
 
-  Inference(context, buffers, stream, max_batch_size);
+  Inference(context, buffers, max_batch_size, output_index);
 
-  /*
-  auto serial = engine->serialize();
-  std::ofstream outfile ("serial.bin",std::ofstream::binary);
-  outfile.write((const char*)serial->data(), serial->size());
-  outfile.close();
-  serial->destroy();
-  */
-  cudaFree(buffers[0]);
-  cudaFree(buffers[1]);
+  context->destroy();
+  engine->destroy();
+
+  for (auto* ptr : buffers) {
+    cudaFree(ptr);
+  }
 }
 
 void ParseArguments(int argc, const char** argv) {
