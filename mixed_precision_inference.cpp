@@ -41,7 +41,7 @@ public:
 static Logger gLogger(ILogger::Severity::kINFO);
 
 static INetworkDefinition* gNET = nullptr;
-static DataType gDATA_TYPE = DataType::kINT8;
+static DataType gDATA_TYPE = DataType::kFLOAT;
 static const char* kINPUT_NAME = "my_intput";
 static const char* kOUTPUT_NAME = "my_output";
 static const char* kWEIGHT_NAME = "my_weight";
@@ -49,9 +49,9 @@ static int gMAX_BATCH_SIZE = 8;
 static size_t gWORKSAPCE_SIZE = 0;
 static int gCUDA_DEVICE = 0;
 static std::vector<float*> gWEIGHT;
-static const int kINPUT_CHANNEL = 256;
+static const int kINPUT_CHANNEL = 3;
 static const int kINPUT_SIZE = 128;
-static const int kOUTPUT_CHANNEL = 256;
+static const int kOUTPUT_CHANNEL = 64;
 static const int kFILTER_SIZE = 3;
 
 void DelWeight(void) {
@@ -74,7 +74,7 @@ void SetLayerPrecision(ILayer* layer, DataType dtype = DataType::kFLOAT) {
 }
 
 ITensor* Input(const char* input_name, int c, int hw) {
-  auto* input_out = gNET->addInput(input_name, DataType::kFLOAT, DimsCHW(c, hw, hw));
+  auto* input_out = gNET->addInput(input_name, DataType::kFLOAT, Dims4{1, c, hw, hw});
 
   if (gDATA_TYPE == DataType::kINT8) {
     SetTensorRange(input_out);
@@ -83,7 +83,7 @@ ITensor* Input(const char* input_name, int c, int hw) {
 }
 
 ITensor* Input8(const char* input_name, int c, int hw) {
-  auto* input_out = gNET->addInput(input_name, DataType::kINT8, DimsCHW(c, hw, hw));
+  auto* input_out = gNET->addInput(input_name, DataType::kINT8, Dims4{1, c, hw, hw});
 
   if (gDATA_TYPE == DataType::kINT8) {
     SetTensorRange(input_out);
@@ -126,43 +126,29 @@ ITensor* Conv(ITensor* input_tensor, int fco, int fci, int fhw, int stride, Data
   return tensor_out;
 }
 
-ITensor* ElemAdd(ITensor* input_tensor1, ITensor* input_tensor2, DataType dtype) {
-  auto* elem_add_layer = gNET->addElementWise(*input_tensor1, *input_tensor2, ElementWiseOperation::kSUM);
-
-  // SetLayerPrecision(elem_add_layer);
-  // force layer to be FP32
-  elem_add_layer->setPrecision(DataType::kFLOAT);
-  elem_add_layer->setOutputType(0, DataType::kFLOAT);
-  return elem_add_layer->getOutput(0);
-}
-
 std::vector<void*> PrepareInputOutputBuffers(const ICudaEngine* engine, 
   int max_batch_size,
   const char* output_name, int co,
   const char* input_name, int ci, int hw,
   const char* weight_name) {
 
-  std::vector<void*> buffers(3);
+  auto nb_buff = engine->getNbBindings();
+  std::cout << "number of bindings: " << nb_buff << std::endl;
+
+  std::vector<void*> buffers(nb_buff);
 
   int input_num = max_batch_size * ci * hw * hw;
   
   float *input_dev; 
   cudaMalloc((void**)&input_dev, input_num * sizeof(float));
-
   const int input_index = engine->getBindingIndex(input_name);
-  buffers[input_index] = static_cast<void*>(input_dev);
+  buffers[input_index] = reinterpret_cast<void*>(input_dev);
 
-  int output_num = max_batch_size * co * hw * hw;
+  int output_num = max_batch_size * co * hw/2 * hw/2;
   float *output_dev;
   cudaMalloc((void**)&output_dev, output_num * sizeof(float));
   const int output_index = engine->getBindingIndex(output_name);
-  buffers[output_index] = static_cast<void*>(output_dev);
-
-  int weight_num = max_batch_size * co * hw * hw;
-  float *weight_dev;
-  cudaMalloc((void**)&weight_dev, weight_num * sizeof(float));
-  const int weight_index = engine->getBindingIndex(weight_name);
-  buffers[weight_index] = static_cast<void*>(weight_dev);
+  buffers[output_index] = reinterpret_cast<void*>(output_dev);
 
   return buffers;
 }
@@ -171,10 +157,12 @@ void Inference(IExecutionContext* context, std::vector<void*> buffers, cudaStrea
   struct timeval start;
   struct timeval end; 
 
-  for (int j = 0; j < 10; ++j) {
+  const int loop = 1;
+  const int itr = 1;
+  for (int j = 0; j < loop; ++j) {
     gettimeofday(&start, nullptr);
-    for (int i = 0; i < 10; ++i) {
-      context->enqueue(1, buffers.data(), stream, nullptr);
+    for (int i = 0; i < itr; ++i) {
+      context->enqueueV2((void**)buffers.data(), stream, nullptr);
     }
     cudaStreamSynchronize(stream);
     gettimeofday(&end, nullptr);
@@ -185,32 +173,115 @@ void Inference(IExecutionContext* context, std::vector<void*> buffers, cudaStrea
   }
 }
 
+void LogDimsInfo(ITensor* tensor) {
+  auto dims = tensor->getDimensions();
+  for (int i = 0; i < dims.nbDims; ++i) {
+    printf("%d, ", dims.d[i]);
+  }
+  printf("\n");
+}
+
+void LogDimsInfoFromLayer(ILayer* layer) {
+  LogDimsInfo(layer->getOutput(0));
+}
+
 void UseTrtLayerAPI(int max_batch_size, size_t workspace_size, DataType exec_type) {
   auto builder = createInferBuilder(gLogger);
-  gNET = builder->createNetwork();
+  gNET = builder->createNetworkV2(1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH));
 
-  auto* input    = Input(kINPUT_NAME, kINPUT_CHANNEL, kINPUT_SIZE);
-  auto* conv0 = Conv(input, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* conv1 = Conv(conv0, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* conv2 = Conv(conv1, kOUTPUT_CHANNEL, kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
-  auto* w_out    = Input(kWEIGHT_NAME, kOUTPUT_CHANNEL, kINPUT_SIZE);
-  auto* output   = ElemAdd(conv2, w_out, DataType::kFLOAT);
+  auto* input = Input(kINPUT_NAME, kINPUT_CHANNEL, -1);
+  auto* conv0 = Conv(input, kOUTPUT_CHANNEL,
+    kINPUT_CHANNEL, kFILTER_SIZE, 1, exec_type);
+  LogDimsInfo(conv0);
+  auto* pool = gNET->addPooling(*conv0,
+    PoolingType::kMAX, DimsHW{2, 2});
+  LogDimsInfoFromLayer(pool);
+
+  // start to calculate dims
+
+  auto* shape0 = gNET->addShape(*conv0);
+  LogDimsInfoFromLayer(shape0);
+  auto* slice1 = gNET->addSlice(*shape0->getOutput(0), 
+    Dims{1, {0}, {}}, Dims{1, {1}, {}}, Dims{1, {1}, {}});
+  LogDimsInfoFromLayer(slice1);
+  auto* slice2 = gNET->addSlice(*shape0->getOutput(0), 
+    Dims{1, {1}, {}}, Dims{1, {1}, {}}, Dims{1, {1}, {}});
+  LogDimsInfoFromLayer(slice2);
+  auto* slice3 = gNET->addSlice(*shape0->getOutput(0), 
+    Dims{1, {2}, {}}, Dims{1, {1}, {}}, Dims{1, {1}, {}});
+  LogDimsInfoFromLayer(slice3);
+  auto* slice4 = gNET->addSlice(*shape0->getOutput(0), 
+    Dims{1, {3}, {}}, Dims{1, {1}, {}}, Dims{1, {1}, {}});
+  LogDimsInfoFromLayer(slice4);
+
+  auto* eltmul = gNET->addElementWise(
+    *slice2->getOutput(0),
+    *slice3->getOutput(0), 
+    ElementWiseOperation::kPROD);
+  LogDimsInfoFromLayer(eltmul);
+
+  const int two = 2;
+
+  auto* constant = gNET->addConstant(Dims{1, {1}, {}},
+    Weights{DataType::kINT32, &two, 1});
+  LogDimsInfoFromLayer(constant);
+
+  auto* eltdiv0 = gNET->addElementWise(
+    *eltmul->getOutput(0),
+    *constant->getOutput(0),
+    ElementWiseOperation::kDIV);
+  LogDimsInfoFromLayer(eltdiv0);
+
+  auto* eltdiv1 = gNET->addElementWise(
+    *slice4->getOutput(0),
+    *constant->getOutput(0),
+    ElementWiseOperation::kDIV);
+  LogDimsInfoFromLayer(eltdiv1);
+
+  std::vector<ITensor*> concatIn;
+  concatIn.push_back(slice1->getOutput(0));
+  concatIn.push_back(eltdiv0->getOutput(0));
+  concatIn.push_back(eltdiv1->getOutput(0));
+
+  auto* concat = gNET->addConcatenation(
+    concatIn.data(), 3);
+  LogDimsInfoFromLayer(concat);
+  concat->setAxis(0);
+  LogDimsInfoFromLayer(concat);
+
+  // end of calculate dims
+
+  auto* shuffe = gNET->addShuffle(*pool->getOutput(0));
+  LogDimsInfoFromLayer(shuffe);
+  shuffe->setInput(1, *concat->getOutput(0));
+  LogDimsInfoFromLayer(shuffe);
+  
+  auto* output = shuffe->getOutput(0);
   output->setName(kOUTPUT_NAME);
   gNET->markOutput(*output);
 
-  builder->setMaxBatchSize(max_batch_size);
-  builder->setMaxWorkspaceSize(workspace_size);
+  // Finally, configure and build the preprocessor engine.
+  auto preprocessorConfig = builder->createBuilderConfig();
+  preprocessorConfig->setFlag(BuilderFlag::kDEBUG);
+  preprocessorConfig->setFlag(BuilderFlag::kSTRICT_TYPES);
+  preprocessorConfig->setMaxWorkspaceSize(workspace_size);
 
   if (exec_type == DataType::kHALF) {
-    builder->setFp16Mode(true);
+    preprocessorConfig->setFlag(BuilderFlag::kFP16);
   }
   else if (exec_type == DataType::kINT8) {
-    builder->setInt8Mode(true);
-    builder->setInt8Calibrator(nullptr);
+    preprocessorConfig->setFlag(BuilderFlag::kINT8);
+    preprocessorConfig->setInt8Calibrator(nullptr);
   }
 
-  builder->setStrictTypeConstraints(true);
-  auto engine = builder->buildCudaEngine(*gNET); 
+  auto profile = builder->createOptimizationProfile();
+  profile->setDimensions(input->getName(), OptProfileSelector::kMIN, Dims4{1, kINPUT_CHANNEL, kINPUT_SIZE/2, kINPUT_SIZE/2});
+  profile->setDimensions(input->getName(), OptProfileSelector::kOPT, Dims4{1, kINPUT_CHANNEL,   kINPUT_SIZE,   kINPUT_SIZE});
+  profile->setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4{1, kINPUT_CHANNEL, kINPUT_SIZE*2, kINPUT_SIZE*2});
+  preprocessorConfig->addOptimizationProfile(profile);
+
+  auto engine = builder->buildEngineWithConfig(*gNET, *preprocessorConfig);
+
   gNET->destroy(); 
   DelWeight();
 
@@ -223,16 +294,11 @@ void UseTrtLayerAPI(int max_batch_size, size_t workspace_size, DataType exec_typ
   cudaStreamCreate(&stream);
   std::cout << "Executing..." << std::endl;
   auto context = engine->createExecutionContext();
+  auto input_idx = engine->getBindingIndex(kINPUT_NAME);
+  context->setBindingDimensions(input_idx, Dims4{1, kINPUT_CHANNEL, kINPUT_SIZE, kINPUT_SIZE});
+  assert(context->allInputDimensionsSpecified() == true);
 
   Inference(context, buffers, stream, max_batch_size);
-
-  /*
-  auto serial = engine->serialize();
-  std::ofstream outfile ("serial.bin",std::ofstream::binary);
-  outfile.write((const char*)serial->data(), serial->size());
-  outfile.close();
-  serial->destroy();
-  */
   cudaFree(buffers[0]);
   cudaFree(buffers[1]);
 }
